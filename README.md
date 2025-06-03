@@ -3,7 +3,7 @@
 SmartEye is a real-time security monitoring system powered by YOLOv8 and pose estimation.
 It detects:
 - Persons, weapons, and objects
-- Human behaviors like sitting, jumping, and **falling**
+- Human postions like sitting, jumping, and **falling**
 
 🧠 Features:
 - Real-time detection with webcam or video
