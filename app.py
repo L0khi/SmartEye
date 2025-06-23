@@ -1,4 +1,4 @@
-# === SmartEye: Dual IR+RGB Security Detection with Pose Estimation & WhatsApp Alerts ===
+# === SmartEye: AI Security System with Image Processing & Human-Only Pose Detection ===
 
 import cv2
 import time
@@ -70,74 +70,88 @@ def log_detection(detections, frame, save_image=True):
 def detect_objects(frame):
     results = model(frame)[0]
     detections = []
+    humans = []
     annotated = frame.copy()
 
     for box in results.boxes:
         cls_id = int(box.cls[0].item())
         cls_name = model.names[cls_id]
-        if cls_name not in DETECTION_CLASSES:
-            continue
-
         conf = float(box.conf[0].item())
         if conf < CONFIDENCE_THRESHOLD:
             continue
 
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-        detections.append({
+        detection = {
             "class": cls_name,
             "confidence": round(conf, 2),
             "bbox": [x1, y1, x2, y2]
-        })
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(annotated, f"{cls_name} {conf:.2f}", (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        }
+        detections.append(detection)
 
-    return annotated, detections
+        if cls_name == "person":
+            humans.append((x1, y1, x2, y2))
 
-# === Pose Estimation & Fall Detection ===
-def detect_pose(frame):
-    results = pose_model(frame)[0]
-    annotated = frame.copy()
+        if cls_name in DETECTION_CLASSES:
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(annotated, f"{cls_name} {conf:.2f}", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    return annotated, detections, humans
+
+# === Pose Estimation: Human-Only ===
+def detect_pose(frame, human_bboxes):
     poses = []
+    annotated = frame.copy()
 
-    for kp in results.keypoints.xy:
-        keypoints = kp.cpu().numpy().astype(int)
-        for i, (x, y) in enumerate(keypoints):
-            cv2.circle(annotated, (x, y), 3, (0, 0, 255), -1)
+    for (x1, y1, x2, y2) in human_bboxes:
+        person_roi = annotated[y1:y2, x1:x2]
+        if person_roi.size == 0:
+            continue
+        results = pose_model(person_roi)[0]
+        for kp in results.keypoints.xy:
+            keypoints = kp.cpu().numpy().astype(int)
+            for i, (x, y) in enumerate(keypoints):
+                cv2.circle(annotated, (x + x1, y + y1), 3, (0, 0, 255), -1)
 
-        if len(keypoints) >= 5:
-            y_diffs = abs(keypoints[0][1] - keypoints[1][1])
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            if len(keypoints) >= 5:
+                y_diffs = abs(keypoints[0][1] - keypoints[1][1])
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-            if y_diffs < 10:
-                pose_state = "Fall Detected"
-                play_alert()
-                img_path = log_detection({"pose": pose_state}, annotated, SAVE_IMAGE)
-                send_whatsapp_alert(f"⚠️ SmartEye: Fall detected at {timestamp}", img_path)
-            elif abs(keypoints[11][1] - keypoints[13][1]) < 15:
-                pose_state = "Sitting"
-            else:
-                pose_state = "Standing"
-        
-            poses.append(pose_state)
-            cv2.putText(annotated, pose_state, (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                if y_diffs < 10:
+                    pose_state = "Fall Detected"
+                    play_alert()
+                    img_path = log_detection({"pose": pose_state}, annotated, SAVE_IMAGE)
+                    send_whatsapp_alert(f"⚠️ SmartEye: Fall detected at {timestamp}", img_path)
+                elif abs(keypoints[11][1] - keypoints[13][1]) < 15:
+                    pose_state = "Sitting"
+                    send_whatsapp_alert(f"🪑 SmartEye: Sitting posture detected at {timestamp}")
+                elif keypoints[5][1] < keypoints[11][1]:
+                    pose_state = "Standing"
+                else:
+                    pose_state = "Jumping"
+                    send_whatsapp_alert(f"🤸 SmartEye: Jumping detected at {timestamp}")
+
+                poses.append(pose_state)
+                cv2.putText(annotated, pose_state, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
     return annotated, poses
 
 # === Streamlit GUI ===
 st.set_page_config(page_title="SmartEye Security AI", layout="wide")
-st.title("🔒 SmartEye: Real-Time IR+RGB Detection + WhatsApp Alerts")
+st.title("🔒 SmartEye: Real-Time IR+RGB Detection + Human Pose Alerts")
 st.markdown("""SmartEye is a dual-mode AI security system using YOLOv8 and Pose Detection.
 Detects persons, weapons, behaviors (sit, fall, jump), and logs events from IR and RGB inputs.
-Now includes custom posture WhatsApp alerts and image snapshot on fall.""")
+Only analyzes pose for human objects and supports image input processing too.""")
 
-option = st.radio("Select Input Source:", ("Webcam", "Upload Video"))
+option = st.radio("Select Input Source:", ("Webcam", "Upload Video", "Image"))
 run_detection = st.toggle("Activate Detection", value=False)
 
 frame_placeholder = st.empty()
 log_placeholder = st.empty()
 
 cap = None
+uploaded_img = None
+
 if option == "Webcam":
     cap = cv2.VideoCapture(0)
 elif option == "Upload Video":
@@ -147,21 +161,47 @@ elif option == "Upload Video":
         with open(temp_path, "wb") as f:
             f.write(uploaded_file.read())
         cap = cv2.VideoCapture(temp_path)
+elif option == "Image":
+    uploaded_img = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
+    if uploaded_img is not None:
+        img = Image.open(uploaded_img)
+        frame = np.array(img.convert("RGB"))
+        run_detection = True
 
 # === Main Loop ===
-if run_detection and cap:
+if run_detection:
     st.info("Detection Running. Press Stop to end.")
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            st.warning("Video has ended or camera feed lost.")
-            break
+    if cap:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                st.warning("Video has ended or camera feed lost.")
+                break
 
-        annotated_obj, detections = detect_objects(frame)
-        annotated_pose, poses = detect_pose(annotated_obj)
+            annotated_obj, detections, humans = detect_objects(frame)
+            annotated_pose, poses = detect_pose(annotated_obj, humans)
+            frame_rgb = cv2.cvtColor(annotated_pose, cv2.COLOR_BGR2RGB)
+            frame_placeholder.image(frame_rgb, channels="RGB")
+
+            if detections or poses:
+                log_detection({"objects": detections, "poses": poses}, annotated_pose, SAVE_IMAGE)
+                with log_placeholder.container():
+                    st.write("🚨 **Event Alert:**")
+                    for det in detections:
+                        st.json(det)
+                    for p in poses:
+                        st.write(f"🧍 Pose Detected: {p}")
+
+            if not run_detection:
+                st.warning("Detection paused.")
+                break
+
+        cap.release()
+    elif uploaded_img is not None:
+        annotated_obj, detections, humans = detect_objects(frame)
+        annotated_pose, poses = detect_pose(annotated_obj, humans)
         frame_rgb = cv2.cvtColor(annotated_pose, cv2.COLOR_BGR2RGB)
         frame_placeholder.image(frame_rgb, channels="RGB")
-
         if detections or poses:
             log_detection({"objects": detections, "poses": poses}, annotated_pose, SAVE_IMAGE)
             with log_placeholder.container():
@@ -171,12 +211,5 @@ if run_detection and cap:
                 for p in poses:
                     st.write(f"🧍 Pose Detected: {p}")
 
-        if not run_detection:
-            st.warning("Detection paused.")
-            break
-
-    cap.release()
-
 st.markdown("---")
 st.caption("SmartEye © 2025 | Dual Vision AI + WhatsApp Alerts by Lokhi D.")
-# Full app.py content should be pasted here after export.
